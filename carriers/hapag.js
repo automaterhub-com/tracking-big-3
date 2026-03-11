@@ -2,6 +2,10 @@ const { createTrackingSession } = require("../lib/browser");
 const path = require("path");
 const fs = require("fs");
 
+const TRACKING_URL =
+  "https://www.hapag-lloyd.com/en/online-business/track/track-by-booking-solution.html";
+const DIAG_DIR = path.join(__dirname, "..", ".profiles", "hapag");
+
 async function trackHapag(trackingNumber) {
   const session = await createTrackingSession("hapag");
 
@@ -19,10 +23,13 @@ async function trackHapag(trackingNumber) {
 async function scrapeTracking(page, trackingNumber) {
   await new Promise((r) => setTimeout(r, 500 + Math.random() * 1000));
 
-  await page.goto(
-    "https://www.hapag-lloyd.com/en/online-business/track/track-by-booking-solution.html",
-    { waitUntil: "domcontentloaded", timeout: 30000 }
-  );
+  await page.goto(TRACKING_URL, {
+    waitUntil: "domcontentloaded",
+    timeout: 30000,
+  });
+
+  // Handle Cloudflare Turnstile challenge if present
+  await handleCloudflareChallenge(page);
 
   // Cookie consent
   try {
@@ -34,48 +41,8 @@ async function scrapeTracking(page, trackingNumber) {
 
   await page.waitForTimeout(2000);
 
-  // Fill BL in "Bill of Lading No." field — try multiple selectors
-  const blSelectors = [
-    'input[name="tracing_by_booking_f:hl16"]',
-    'input[name*="hl16"]',
-    'input[name*="booking_f"][type="text"]',
-    'input[id*="hl16"]',
-    'input[placeholder*="Bill of Lading"]',
-    'input[placeholder*="B/L"]',
-  ];
-  let blInput = null;
-  for (const sel of blSelectors) {
-    try {
-      const loc = page.locator(sel).first();
-      if (await loc.isVisible({ timeout: 2000 })) {
-        blInput = loc;
-        console.log(`[hapag] Found BL input with selector: ${sel}`);
-        break;
-      }
-    } catch {}
-  }
-  if (!blInput) {
-    // Last resort: find any visible text input
-    const allInputs = page.locator('input[type="text"]');
-    const inputCount = await allInputs.count();
-    console.log(`[hapag] No BL input found. Visible text inputs: ${inputCount}`);
-    // Save diagnostic screenshot
-    const diagDir = path.join(__dirname, "..", ".profiles", "hapag");
-    fs.mkdirSync(diagDir, { recursive: true });
-    await page.screenshot({ path: path.join(diagDir, "debug-page.png"), fullPage: true });
-    const html = await page.content();
-    fs.writeFileSync(path.join(diagDir, "debug-page.html"), html);
-    console.log(`[hapag] Saved debug screenshot and HTML to ${diagDir}`);
-    // Try to find any text input that could be the BL field
-    for (let i = 0; i < inputCount; i++) {
-      const inp = allInputs.nth(i);
-      const name = await inp.getAttribute("name").catch(() => "");
-      const id = await inp.getAttribute("id").catch(() => "");
-      const placeholder = await inp.getAttribute("placeholder").catch(() => "");
-      console.log(`[hapag]   input[${i}]: name="${name}" id="${id}" placeholder="${placeholder}"`);
-    }
-    throw new Error("Could not find BL input field — page structure may have changed. Check .profiles/hapag/debug-page.png");
-  }
+  // Fill BL in "Bill of Lading No." field
+  const blInput = await findBlInput(page);
   await blInput.click();
   await blInput.fill(trackingNumber);
 
@@ -165,6 +132,122 @@ async function scrapeTracking(page, trackingNumber) {
     },
     containers,
   };
+}
+
+// --- Cloudflare Turnstile ---
+
+async function handleCloudflareChallenge(page) {
+  const bodyText = await page.textContent("body").catch(() => "");
+  if (!bodyText.includes("Security Check") && !bodyText.includes("Verify you are human")) {
+    return; // No challenge
+  }
+
+  console.log("[hapag] Cloudflare challenge detected, attempting to solve...");
+
+  // Attempt 1: Wait for Turnstile to auto-solve (up to 10s)
+  const solved = await waitForChallengePass(page, 10000);
+  if (solved) {
+    console.log("[hapag] Cloudflare challenge auto-solved");
+    return;
+  }
+
+  // Attempt 2: Click the Turnstile checkbox inside iframe
+  console.log("[hapag] Trying to click Turnstile checkbox...");
+  try {
+    const turnstileFrame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
+    // The checkbox is typically a div with role or the body of the iframe
+    await turnstileFrame.locator("body").click({ timeout: 5000 });
+  } catch {
+    // Some Turnstile versions use a different structure
+    try {
+      const frames = page.frames();
+      for (const frame of frames) {
+        if (frame.url().includes("challenges.cloudflare.com")) {
+          await frame.click("body", { timeout: 3000 });
+          break;
+        }
+      }
+    } catch {}
+  }
+
+  // Wait for challenge to pass after click
+  const solvedAfterClick = await waitForChallengePass(page, 15000);
+  if (solvedAfterClick) {
+    console.log("[hapag] Cloudflare challenge solved after click");
+    return;
+  }
+
+  // Save diagnostic screenshot
+  fs.mkdirSync(DIAG_DIR, { recursive: true });
+  await page.screenshot({
+    path: path.join(DIAG_DIR, "debug-challenge.png"),
+    fullPage: true,
+  });
+  console.log("[hapag] Challenge not solved — saved debug-challenge.png");
+  throw new Error("Cloudflare Turnstile challenge could not be solved automatically");
+}
+
+async function waitForChallengePass(page, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    // Check if page navigated away from challenge
+    const text = await page.textContent("body").catch(() => "");
+    if (!text.includes("Security Check") && !text.includes("Verify you are human")) {
+      // Wait a bit for the actual page to load
+      await page.waitForTimeout(2000);
+      return true;
+    }
+    // Check if Turnstile set the response token (means it passed)
+    const hasToken = await page.evaluate(() => {
+      const input = document.querySelector('input[name="cf-turnstile-response"]');
+      return input && input.value && input.value.length > 0;
+    }).catch(() => false);
+    if (hasToken) {
+      // Token set, wait for form submission / redirect
+      await page.waitForTimeout(3000);
+      return true;
+    }
+    await page.waitForTimeout(1000);
+  }
+  return false;
+}
+
+// --- BL Input Finder ---
+
+async function findBlInput(page) {
+  const selectors = [
+    'input[name="tracing_by_booking_f:hl16"]',
+    'input[name*="hl16"]',
+    'input[name*="booking_f"][type="text"]',
+    'input[id*="hl16"]',
+    'input[placeholder*="Bill of Lading"]',
+    'input[placeholder*="B/L"]',
+  ];
+  for (const sel of selectors) {
+    try {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible({ timeout: 2000 })) {
+        console.log(`[hapag] Found BL input: ${sel}`);
+        return loc;
+      }
+    } catch {}
+  }
+
+  // Last resort: enumerate visible text inputs
+  const allInputs = page.locator('input[type="text"]');
+  const inputCount = await allInputs.count();
+  console.log(`[hapag] No BL input found with known selectors. Text inputs: ${inputCount}`);
+  for (let i = 0; i < inputCount; i++) {
+    const inp = allInputs.nth(i);
+    const name = await inp.getAttribute("name").catch(() => "");
+    const id = await inp.getAttribute("id").catch(() => "");
+    console.log(`[hapag]   input[${i}]: name="${name}" id="${id}"`);
+  }
+
+  // Save diagnostic screenshot
+  fs.mkdirSync(DIAG_DIR, { recursive: true });
+  await page.screenshot({ path: path.join(DIAG_DIR, "debug-page.png"), fullPage: true });
+  throw new Error("Could not find BL input field — check .profiles/hapag/debug-page.png");
 }
 
 // --- Page Parsers ---
