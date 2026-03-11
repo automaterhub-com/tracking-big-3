@@ -1,4 +1,6 @@
 const { createTrackingSession } = require("../lib/browser");
+const path = require("path");
+const fs = require("fs");
 
 async function trackHapag(trackingNumber) {
   const session = await createTrackingSession("hapag");
@@ -32,8 +34,48 @@ async function scrapeTracking(page, trackingNumber) {
 
   await page.waitForTimeout(2000);
 
-  // Fill BL in "Bill of Lading No." field (hl16)
-  const blInput = page.locator('input[name="tracing_by_booking_f:hl16"]');
+  // Fill BL in "Bill of Lading No." field — try multiple selectors
+  const blSelectors = [
+    'input[name="tracing_by_booking_f:hl16"]',
+    'input[name*="hl16"]',
+    'input[name*="booking_f"][type="text"]',
+    'input[id*="hl16"]',
+    'input[placeholder*="Bill of Lading"]',
+    'input[placeholder*="B/L"]',
+  ];
+  let blInput = null;
+  for (const sel of blSelectors) {
+    try {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible({ timeout: 2000 })) {
+        blInput = loc;
+        console.log(`[hapag] Found BL input with selector: ${sel}`);
+        break;
+      }
+    } catch {}
+  }
+  if (!blInput) {
+    // Last resort: find any visible text input
+    const allInputs = page.locator('input[type="text"]');
+    const inputCount = await allInputs.count();
+    console.log(`[hapag] No BL input found. Visible text inputs: ${inputCount}`);
+    // Save diagnostic screenshot
+    const diagDir = path.join(__dirname, "..", ".profiles", "hapag");
+    fs.mkdirSync(diagDir, { recursive: true });
+    await page.screenshot({ path: path.join(diagDir, "debug-page.png"), fullPage: true });
+    const html = await page.content();
+    fs.writeFileSync(path.join(diagDir, "debug-page.html"), html);
+    console.log(`[hapag] Saved debug screenshot and HTML to ${diagDir}`);
+    // Try to find any text input that could be the BL field
+    for (let i = 0; i < inputCount; i++) {
+      const inp = allInputs.nth(i);
+      const name = await inp.getAttribute("name").catch(() => "");
+      const id = await inp.getAttribute("id").catch(() => "");
+      const placeholder = await inp.getAttribute("placeholder").catch(() => "");
+      console.log(`[hapag]   input[${i}]: name="${name}" id="${id}" placeholder="${placeholder}"`);
+    }
+    throw new Error("Could not find BL input field — page structure may have changed. Check .profiles/hapag/debug-page.png");
+  }
   await blInput.click();
   await blInput.fill(trackingNumber);
 
