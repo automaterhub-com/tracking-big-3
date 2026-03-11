@@ -1,0 +1,23 @@
+{
+  "name": "tracking-big-3",
+  "version": "1.0.0",
+  "description": "Container tracking for Maersk, CMA-CGM, and MSC",
+  "main": "index.js",
+  "scripts": {
+    "postinstall": "npx playwright install chromium",
+    "update:stealth": "npm update playwright playwright-extra puppeteer-extra-plugin-stealth && npx playwright install chromium",
+    "start": "node server.js",
+    "track": "node index.js",
+    "track:maersk": "node index.js maersk"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.2.1",
+    "playwright": "^1.58.2",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
