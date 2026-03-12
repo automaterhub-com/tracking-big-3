@@ -186,12 +186,20 @@ async function handleCloudflareChallenge(page) {
 
   console.log("[hapag] Using 2captcha to solve Turnstile...");
   const sitekey = await page.evaluate(() => {
+    // Method 1: data-sitekey attribute
     const widget = document.querySelector('[data-sitekey]');
     if (widget) return widget.getAttribute('data-sitekey');
+    // Method 2: iframe src with k= parameter
     const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
     if (iframe) {
       const match = iframe.src.match(/[?&]k=([^&]+)/);
-      return match ? match[1] : null;
+      if (match) return match[1];
+    }
+    // Method 3: Extract from Turnstile challenge URL in performance entries
+    const entries = performance.getEntries();
+    for (const entry of entries) {
+      const m = entry.name.match(/challenges\.cloudflare\.com\/.*\/(0x[A-Za-z0-9_-]{10,})\//);
+      if (m) return m[1];
     }
     return null;
   });
