@@ -1,5 +1,4 @@
 const { createTrackingSession } = require("../lib/browser");
-const { Solver } = require("2captcha-ts");
 const path = require("path");
 const fs = require("fs");
 
@@ -23,6 +22,28 @@ async function trackHapag(trackingNumber) {
 
 async function scrapeTracking(page, trackingNumber) {
   await new Promise((r) => setTimeout(r, 500 + Math.random() * 1000));
+
+  // Inject turnstile.render() interception before navigating
+  await page.addInitScript(() => {
+    window.__turnstileParams = null;
+    window.__tsCallback = null;
+    const i = setInterval(() => {
+      if (window.turnstile) {
+        clearInterval(i);
+        const origRender = window.turnstile.render;
+        window.turnstile.render = (a, b) => {
+          window.__turnstileParams = {
+            sitekey: b.sitekey,
+            action: b.action,
+            cData: b.cData,
+            chlPageData: b.chlPageData,
+          };
+          window.__tsCallback = b.callback;
+          return origRender.call(window.turnstile, a, b);
+        };
+      }
+    }, 10);
+  });
 
   await page.goto(TRACKING_URL, {
     waitUntil: "domcontentloaded",
@@ -184,56 +205,90 @@ async function handleCloudflareChallenge(page) {
     throw new Error("Cloudflare Turnstile challenge — set TWOCAPTCHA_API_KEY to solve automatically");
   }
 
-  console.log("[hapag] Using 2captcha to solve Turnstile...");
-  const sitekey = await page.evaluate(() => {
-    // Method 1: data-sitekey attribute
-    const widget = document.querySelector('[data-sitekey]');
-    if (widget) return widget.getAttribute('data-sitekey');
-    // Method 2: iframe src with k= parameter
-    const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-    if (iframe) {
-      const match = iframe.src.match(/[?&]k=([^&]+)/);
-      if (match) return match[1];
-    }
-    // Method 3: Extract from Turnstile challenge URL in performance entries
-    const entries = performance.getEntries();
-    for (const entry of entries) {
-      const m = entry.name.match(/challenges\.cloudflare\.com\/.*\/(0x[A-Za-z0-9_-]{10,})\//);
-      if (m) return m[1];
-    }
-    return null;
-  });
-
-  if (!sitekey) {
-    fs.mkdirSync(DIAG_DIR, { recursive: true });
-    await page.screenshot({ path: path.join(DIAG_DIR, "debug-challenge.png"), fullPage: true });
-    throw new Error("Could not extract Turnstile sitekey — saved debug-challenge.png");
+  // Wait for turnstile.render() params to be captured by our init script
+  console.log("[hapag] Waiting for Turnstile render params...");
+  let tsParams = null;
+  for (let w = 0; w < 15; w++) {
+    tsParams = await page.evaluate(() => window.__turnstileParams);
+    if (tsParams) break;
+    await page.waitForTimeout(1000);
   }
 
-  console.log(`[hapag] Turnstile sitekey: ${sitekey}`);
-  const solver = new Solver(apiKey);
-  const result = await solver.cloudflareTurnstile({
-    pageurl: page.url(),
-    sitekey,
+  if (!tsParams || !tsParams.sitekey) {
+    fs.mkdirSync(DIAG_DIR, { recursive: true });
+    await page.screenshot({ path: path.join(DIAG_DIR, "debug-challenge.png"), fullPage: true });
+    throw new Error("Could not capture Turnstile params — saved debug-challenge.png");
+  }
+
+  console.log(`[hapag] Turnstile sitekey: ${tsParams.sitekey}, action: ${tsParams.action}`);
+  console.log("[hapag] Sending to 2captcha (createTask API)...");
+
+  // Submit task via new API
+  const createRes = await fetch("https://api.2captcha.com/createTask", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      clientKey: apiKey,
+      task: {
+        type: "TurnstileTaskProxyless",
+        websiteURL: page.url(),
+        websiteKey: tsParams.sitekey,
+        action: tsParams.action || undefined,
+        data: tsParams.cData || undefined,
+        pagedata: tsParams.chlPageData || undefined,
+      },
+    }),
   });
+  const createData = await createRes.json();
+  if (createData.errorId) {
+    throw new Error(`2captcha createTask error: ${createData.errorDescription || JSON.stringify(createData)}`);
+  }
 
-  console.log(`[hapag] 2captcha returned token (${result.data.length} chars)`);
+  const taskId = createData.taskId;
+  console.log(`[hapag] 2captcha taskId: ${taskId}, polling for result...`);
 
-  // Inject the token
-  await page.evaluate((token) => {
+  // Poll for result
+  let token = null;
+  for (let p = 0; p < 60; p++) {
+    await new Promise((r) => setTimeout(r, 5000));
+    const pollRes = await fetch("https://api.2captcha.com/getTaskResult", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientKey: apiKey, taskId }),
+    });
+    const pollData = await pollRes.json();
+    if (pollData.errorId) {
+      throw new Error(`2captcha poll error: ${pollData.errorDescription || JSON.stringify(pollData)}`);
+    }
+    if (pollData.status === "ready") {
+      token = pollData.solution.token;
+      break;
+    }
+  }
+
+  if (!token) {
+    throw new Error("2captcha timed out waiting for Turnstile solution");
+  }
+
+  console.log(`[hapag] 2captcha returned token (${token.length} chars)`);
+
+  // Inject the token via the Turnstile callback
+  const injected = await page.evaluate((tkn) => {
+    if (window.__tsCallback) {
+      window.__tsCallback(tkn);
+      return "callback";
+    }
     const input = document.querySelector('input[name="cf-turnstile-response"]');
-    if (input) input.value = token;
-    const gInput = document.querySelector('input[name="g-recaptcha-response"]');
-    if (gInput) gInput.value = token;
-    // Try triggering the callback
-    if (window.turnstileCallback) window.turnstileCallback(token);
-  }, result.data);
+    if (input) {
+      input.value = tkn;
+      const form = document.querySelector("form");
+      if (form) form.submit();
+      return "form";
+    }
+    return "none";
+  }, token);
 
-  // Submit the form if present
-  await page.evaluate(() => {
-    const form = document.querySelector('form');
-    if (form) form.submit();
-  });
+  console.log(`[hapag] Token injected via: ${injected}`);
 
   const solvedWith2captcha = await waitForChallengePass(page, 15000);
   if (solvedWith2captcha) {
