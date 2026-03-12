@@ -23,30 +23,6 @@ async function trackHapag(trackingNumber) {
 async function scrapeTracking(page, trackingNumber) {
   await new Promise((r) => setTimeout(r, 500 + Math.random() * 1000));
 
-  // Inject turnstile.render() interception before navigating.
-  // We let the original render run so the challenge infrastructure
-  // initializes, but capture the params for 2captcha fallback.
-  await page.addInitScript(() => {
-    window.__turnstileParams = null;
-    window.__tsCallback = null;
-    const i = setInterval(() => {
-      if (window.turnstile) {
-        clearInterval(i);
-        const origRender = window.turnstile.render;
-        window.turnstile.render = (a, b) => {
-          window.__turnstileParams = {
-            sitekey: b.sitekey,
-            action: b.action,
-            cData: b.cData,
-            chlPageData: b.chlPageData,
-          };
-          window.__tsCallback = b.callback;
-          return origRender.call(window.turnstile, a, b);
-        };
-      }
-    }, 10);
-  });
-
   await page.goto(TRACKING_URL, {
     waitUntil: "domcontentloaded",
     timeout: 30000,
@@ -201,127 +177,20 @@ async function handleCloudflareChallenge(page) {
     return;
   }
 
-  // Attempt 3: Use 2captcha Turnstile solver
-  const apiKey = process.env.TWOCAPTCHA_API_KEY;
-  if (!apiKey) {
-    throw new Error("Cloudflare Turnstile challenge — set TWOCAPTCHA_API_KEY to solve automatically");
-  }
-
-  // Wait for turnstile.render() params to be captured by our init script
-  console.log("[hapag] Waiting for Turnstile render params...");
-  let tsParams = null;
-  for (let w = 0; w < 15; w++) {
-    tsParams = await page.evaluate(() => window.__turnstileParams);
-    if (tsParams) break;
-    await page.waitForTimeout(1000);
-  }
-
-  if (!tsParams || !tsParams.sitekey) {
-    fs.mkdirSync(DIAG_DIR, { recursive: true });
-    await page.screenshot({ path: path.join(DIAG_DIR, "debug-challenge.png"), fullPage: true });
-    throw new Error("Could not capture Turnstile params — saved debug-challenge.png");
-  }
-
-  console.log(`[hapag] Turnstile sitekey: ${tsParams.sitekey}, action: ${tsParams.action}`);
-  console.log("[hapag] Sending to 2captcha (createTask API)...");
-
-  // Submit task via new API
-  const createRes = await fetch("https://api.2captcha.com/createTask", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      clientKey: apiKey,
-      task: {
-        type: "TurnstileTaskProxyless",
-        websiteURL: page.url(),
-        websiteKey: tsParams.sitekey,
-        action: tsParams.action || undefined,
-        data: tsParams.cData || undefined,
-        pagedata: tsParams.chlPageData || undefined,
-      },
-    }),
-  });
-  const createData = await createRes.json();
-  if (createData.errorId) {
-    throw new Error(`2captcha createTask error: ${createData.errorDescription || JSON.stringify(createData)}`);
-  }
-
-  const taskId = createData.taskId;
-  console.log(`[hapag] 2captcha taskId: ${taskId}, polling for result...`);
-
-  // Poll for result
-  let token = null;
-  for (let p = 0; p < 60; p++) {
-    await new Promise((r) => setTimeout(r, 5000));
-    const pollRes = await fetch("https://api.2captcha.com/getTaskResult", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientKey: apiKey, taskId }),
-    });
-    const pollData = await pollRes.json();
-    if (pollData.errorId) {
-      throw new Error(`2captcha poll error: ${pollData.errorDescription || JSON.stringify(pollData)}`);
-    }
-    if (pollData.status === "ready") {
-      token = pollData.solution.token;
-      break;
-    }
-  }
-
-  if (!token) {
-    throw new Error("2captcha timed out waiting for Turnstile solution");
-  }
-
-  console.log(`[hapag] 2captcha returned token (${token.length} chars)`);
-
-  // Inject the token and trigger challenge completion
-  console.log("[hapag] Injecting token via callback...");
-  await page.evaluate((tkn) => {
-    const input = document.querySelector('input[name="cf-turnstile-response"]');
-    if (input) input.value = tkn;
-    if (window.__tsCallback) window.__tsCallback(tkn);
-  }, token);
-
-  // Wait 90s without touching the page — let Cloudflare process
-  console.log("[hapag] Waiting 90s for Cloudflare to validate...");
-  await new Promise((r) => setTimeout(r, 90000));
-
-  // Check if we passed
-  const text = await page.textContent("body").catch(() => "");
-  const passed = !text.includes("Security Check") && !text.includes("Verify you are human");
-  console.log(`[hapag] After 90s wait: passed=${passed}, len=${text.length}`);
-
-  if (passed) {
-    console.log("[hapag] Cloudflare challenge solved via 2captcha");
-    return;
-  }
-
-  // Check cookies
-  const cookies = await page.context().cookies();
-  const cfCookie = cookies.find(c => c.name === "cf_clearance");
-  console.log(`[hapag] cf_clearance: ${cfCookie ? "present" : "absent"}`);
-
+  // 2captcha Turnstile solver does NOT work for Cloudflare managed challenges.
+  // The token cannot be injected via callback — Cloudflare's encrypted protocol
+  // requires the full widget flow. Use a residential proxy instead.
   fs.mkdirSync(DIAG_DIR, { recursive: true });
   await page.screenshot({ path: path.join(DIAG_DIR, "debug-challenge.png"), fullPage: true });
-  throw new Error("Cloudflare Turnstile challenge could not be solved — saved debug-challenge.png");
+  throw new Error("Cloudflare Turnstile managed challenge — use a residential proxy (TRACKER_PROXY_URL)");
 }
 
 async function waitForChallengePass(page, timeoutMs) {
   const start = Date.now();
-  let iteration = 0;
   while (Date.now() - start < timeoutMs) {
-    iteration++;
     // Check if page navigated away from challenge
-    const text = await page.textContent("body").catch((e) => {
-      console.log(`[hapag] waitForChallengePass iter ${iteration}: textContent error: ${e.message}`);
-      return "";
-    });
-    const hasSC = text.includes("Security Check");
-    const hasVH = text.includes("Verify you are human");
-    if (iteration <= 3 || (!hasSC && !hasVH)) {
-      console.log(`[hapag] waitForChallengePass iter ${iteration}: SC=${hasSC} VH=${hasVH} len=${text.length}`);
-    }
-    if (!hasSC && !hasVH) {
+    const text = await page.textContent("body").catch(() => "");
+    if (!text.includes("Security Check") && !text.includes("Verify you are human")) {
       // Wait a bit for the actual page to load
       await page.waitForTimeout(2000);
       return true;
