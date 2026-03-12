@@ -282,36 +282,17 @@ async function handleCloudflareChallenge(page) {
     if (window.__tsCallback) window.__tsCallback(tkn);
   }, token);
 
-  // Wait for Cloudflare to validate and set cf_clearance cookie
-  console.log("[hapag] Waiting for Cloudflare to set clearance cookie...");
-  let hasClearance = false;
-  for (let w = 0; w < 30; w++) {
-    await page.waitForTimeout(2000);
-    const cookies = await page.context().cookies();
-    if (cookies.some(c => c.name === "cf_clearance")) {
-      hasClearance = true;
-      console.log("[hapag] cf_clearance cookie obtained!");
-      break;
-    }
+  // Wait for Cloudflare validation + redirect (can take 60-90s)
+  console.log("[hapag] Waiting for challenge to pass (up to 120s)...");
+  const solvedWith2captcha = await waitForChallengePass(page, 120000);
+  if (solvedWith2captcha) {
+    console.log("[hapag] Cloudflare challenge solved via 2captcha");
+    return;
   }
 
-  if (!hasClearance) {
-    // Try navigating anyway — the cookie might be set but not visible
-    console.log("[hapag] No cf_clearance cookie found, trying reload...");
-  }
-
-  // Navigate to the tracking page — challenge should be bypassed now
-  await page.goto(TRACKING_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForTimeout(3000);
-
-  const afterReload = await page.textContent("body").catch(() => "");
-  if (afterReload.includes("Security Check") || afterReload.includes("Verify you are human")) {
-    fs.mkdirSync(DIAG_DIR, { recursive: true });
-    await page.screenshot({ path: path.join(DIAG_DIR, "debug-challenge.png"), fullPage: true });
-    throw new Error("Cloudflare Turnstile challenge could not be solved — saved debug-challenge.png");
-  }
-
-  console.log("[hapag] Cloudflare challenge solved via 2captcha");
+  fs.mkdirSync(DIAG_DIR, { recursive: true });
+  await page.screenshot({ path: path.join(DIAG_DIR, "debug-challenge.png"), fullPage: true });
+  throw new Error("Cloudflare Turnstile challenge could not be solved — saved debug-challenge.png");
 }
 
 async function waitForChallengePass(page, timeoutMs) {
