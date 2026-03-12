@@ -24,10 +24,9 @@ async function scrapeTracking(page, trackingNumber) {
   await new Promise((r) => setTimeout(r, 500 + Math.random() * 1000));
 
   // Inject turnstile.render() interception before navigating.
-  // If TWOCAPTCHA_API_KEY is set, block the original render to prevent
-  // the interactive widget from interfering with 2captcha's token.
-  const has2captcha = !!process.env.TWOCAPTCHA_API_KEY;
-  await page.addInitScript((block) => {
+  // We let the original render run so the challenge infrastructure
+  // initializes, but capture the params for 2captcha fallback.
+  await page.addInitScript(() => {
     window.__turnstileParams = null;
     window.__tsCallback = null;
     const i = setInterval(() => {
@@ -42,12 +41,11 @@ async function scrapeTracking(page, trackingNumber) {
             chlPageData: b.chlPageData,
           };
           window.__tsCallback = b.callback;
-          if (block) return "blocked";
           return origRender.call(window.turnstile, a, b);
         };
       }
     }, 10);
-  }, has2captcha);
+  });
 
   await page.goto(TRACKING_URL, {
     waitUntil: "domcontentloaded",
@@ -276,24 +274,19 @@ async function handleCloudflareChallenge(page) {
 
   console.log(`[hapag] 2captcha returned token (${token.length} chars)`);
 
-  // Inject the token via callback and wait for navigation
-  console.log("[hapag] Injecting token via callback...");
-  try {
-    await Promise.all([
-      page.waitForNavigation({ timeout: 30000 }).catch(() => null),
-      page.evaluate((tkn) => {
-        // Set hidden input
-        const input = document.querySelector('input[name="cf-turnstile-response"]');
-        if (input) input.value = tkn;
-        // Call the callback (triggers Cloudflare validation + redirect)
-        if (window.__tsCallback) window.__tsCallback(tkn);
-      }, token),
-    ]);
-  } catch (e) {
-    console.log(`[hapag] Navigation after callback: ${e.message}`);
-  }
+  // Inject the token and trigger challenge completion
+  console.log("[hapag] Injecting token...");
+  await page.evaluate((tkn) => {
+    // Set the hidden input
+    const input = document.querySelector('input[name="cf-turnstile-response"]');
+    if (input) input.value = tkn;
+    // Call the Turnstile callback to trigger Cloudflare validation
+    if (window.__tsCallback) {
+      window.__tsCallback(tkn);
+    }
+  }, token);
 
-  // Verify we passed the challenge — Cloudflare validation can take 15-20s
+  // Wait for the challenge page to redirect (Cloudflare validates server-side)
   const solvedWith2captcha = await waitForChallengePass(page, 60000);
   if (solvedWith2captcha) {
     console.log("[hapag] Cloudflare challenge solved via 2captcha");
