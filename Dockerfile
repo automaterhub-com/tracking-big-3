@@ -1,6 +1,6 @@
 FROM node:20-slim
 
-# Playwright system dependencies for Chromium + Xvfb for headed mode
+# Playwright system dependencies for Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdrm2 libdbus-1-3 libxkbcommon0 libatspi2.0-0 libxcomposite1 \
@@ -8,7 +8,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 libasound2 libwayland-client0 \
     fonts-liberation fonts-noto-color-emoji \
     ca-certificates \
-    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -26,6 +25,4 @@ RUN mkdir -p .profiles
 
 EXPOSE 3000
 
-# Start Xvfb virtual display, then run the server
-# Xvfb provides a display so Chromium runs in headed mode (bypasses Cloudflare Turnstile)
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &  sleep 1 && DISPLAY=:99 node server.js"]
+CMD ["node", "server.js"]
