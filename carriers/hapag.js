@@ -293,8 +293,8 @@ async function handleCloudflareChallenge(page) {
     console.log(`[hapag] Navigation after callback: ${e.message}`);
   }
 
-  // Verify we passed the challenge
-  const solvedWith2captcha = await waitForChallengePass(page, 10000);
+  // Verify we passed the challenge — Cloudflare validation can take 15-20s
+  const solvedWith2captcha = await waitForChallengePass(page, 60000);
   if (solvedWith2captcha) {
     console.log("[hapag] Cloudflare challenge solved via 2captcha");
     return;
