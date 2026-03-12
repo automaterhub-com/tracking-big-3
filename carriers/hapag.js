@@ -315,10 +315,20 @@ async function handleCloudflareChallenge(page) {
 
 async function waitForChallengePass(page, timeoutMs) {
   const start = Date.now();
+  let iteration = 0;
   while (Date.now() - start < timeoutMs) {
+    iteration++;
     // Check if page navigated away from challenge
-    const text = await page.textContent("body").catch(() => "");
-    if (!text.includes("Security Check") && !text.includes("Verify you are human")) {
+    const text = await page.textContent("body").catch((e) => {
+      console.log(`[hapag] waitForChallengePass iter ${iteration}: textContent error: ${e.message}`);
+      return "";
+    });
+    const hasSC = text.includes("Security Check");
+    const hasVH = text.includes("Verify you are human");
+    if (iteration <= 3 || (!hasSC && !hasVH)) {
+      console.log(`[hapag] waitForChallengePass iter ${iteration}: SC=${hasSC} VH=${hasVH} len=${text.length}`);
+    }
+    if (!hasSC && !hasVH) {
       // Wait a bit for the actual page to load
       await page.waitForTimeout(2000);
       return true;
