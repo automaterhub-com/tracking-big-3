@@ -1,12 +1,12 @@
 const { trackMaersk } = require("./carriers/maersk");
 const { trackMsc } = require("./carriers/msc");
-const { trackHapag } = require("./carriers/hapag");
+// const { trackHapag } = require("./carriers/hapag");  // Disabled — Cloudflare managed challenge on VPS
 
 const CARRIERS = {
   maersk: trackMaersk,
   // cmacgm: trackCmaCgm,   // TODO
   msc: trackMsc,
-  hapag: trackHapag,
+  // hapag: trackHapag,      // Disabled — Cloudflare managed challenge on VPS
 };
 
 const ALIASES = {
