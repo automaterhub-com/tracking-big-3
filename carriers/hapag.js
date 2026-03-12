@@ -282,13 +282,24 @@ async function handleCloudflareChallenge(page) {
     if (window.__tsCallback) window.__tsCallback(tkn);
   }, token);
 
-  // Wait for Cloudflare validation + redirect (can take 60-90s)
-  console.log("[hapag] Waiting for challenge to pass (up to 120s)...");
-  const solvedWith2captcha = await waitForChallengePass(page, 120000);
-  if (solvedWith2captcha) {
+  // Wait 90s without touching the page — let Cloudflare process
+  console.log("[hapag] Waiting 90s for Cloudflare to validate...");
+  await new Promise((r) => setTimeout(r, 90000));
+
+  // Check if we passed
+  const text = await page.textContent("body").catch(() => "");
+  const passed = !text.includes("Security Check") && !text.includes("Verify you are human");
+  console.log(`[hapag] After 90s wait: passed=${passed}, len=${text.length}`);
+
+  if (passed) {
     console.log("[hapag] Cloudflare challenge solved via 2captcha");
     return;
   }
+
+  // Check cookies
+  const cookies = await page.context().cookies();
+  const cfCookie = cookies.find(c => c.name === "cf_clearance");
+  console.log(`[hapag] cf_clearance: ${cfCookie ? "present" : "absent"}`);
 
   fs.mkdirSync(DIAG_DIR, { recursive: true });
   await page.screenshot({ path: path.join(DIAG_DIR, "debug-challenge.png"), fullPage: true });
