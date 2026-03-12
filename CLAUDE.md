@@ -215,11 +215,59 @@ Claude Code assisted project. Typical flow for adding a carrier:
 5. Test with real tracking numbers
 6. Debug anti-bot issues as they arise
 
+## Deployment (VPS)
+
+App runs on the Coolify VPS as a Docker container. Coolify manages networking (Traefik reverse proxy, TLS) but builds are done manually.
+
+- **URL**: `https://tracking.automaterhub.com`
+- **Coolify project ID**: `jsv3q3m9yc08d1iub43hyc77`
+- **Container name**: `jsv3q3m9yc08d1iub43hyc77-135413793574`
+- **Image naming**: `jsv3q3m9yc08d1iub43hyc77:<commit-short-hash>`
+- **Compose file**: `/data/coolify/applications/jsv3q3m9yc08d1iub43hyc77/docker-compose.yaml`
+
+### Deploy steps
+
+```bash
+# Load credentials
+set -a && source ~/.claude/secrets.env && set +a
+
+# 1. Clone repo on VPS, build new image
+ssh -i "$COOLIFY_SSH_KEY" "${COOLIFY_USER}@${COOLIFY_HOST}" \
+  "cd /tmp && rm -rf tracking-big-3 && git clone https://github.com/automaterhub-com/tracking-big-3.git && cd tracking-big-3 && docker build -t jsv3q3m9yc08d1iub43hyc77:<NEW_COMMIT> ."
+
+# 2. Update compose file with new image tag and restart
+ssh -i "$COOLIFY_SSH_KEY" "${COOLIFY_USER}@${COOLIFY_HOST}" \
+  "cd /data/coolify/applications/jsv3q3m9yc08d1iub43hyc77 && sed -i 's|jsv3q3m9yc08d1iub43hyc77:<OLD_COMMIT>|jsv3q3m9yc08d1iub43hyc77:<NEW_COMMIT>|g' docker-compose.yaml && docker compose up -d --no-build"
+
+# 3. Clean up temp clone
+ssh -i "$COOLIFY_SSH_KEY" "${COOLIFY_USER}@${COOLIFY_HOST}" "rm -rf /tmp/tracking-big-3"
+```
+
+### Verify deployment
+
+```bash
+# Check container is running with correct image
+ssh -i "$COOLIFY_SSH_KEY" "${COOLIFY_USER}@${COOLIFY_HOST}" \
+  "docker ps --format '{{.Names}} {{.Image}} {{.Status}}' | grep jsv3"
+
+# Test tracking (from inside VPS, via container IP)
+ssh -i "$COOLIFY_SSH_KEY" "${COOLIFY_USER}@${COOLIFY_HOST}" \
+  'CONTAINER_IP=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" jsv3q3m9yc08d1iub43hyc77-135413793574) && curl -s -X POST "http://$CONTAINER_IP:3000/track" -H "Content-Type: application/json" -d "{\"carrier\":\"msc\",\"reference\":\"MEDUYK515565\"}" --max-time 120'
+```
+
+### Notes
+
+- Docker always runs **headless** — no Xvfb or display server
+- The old commit tag is in the compose file's `image:` field — check it before deploying
+- Coolify manages Traefik labels, TLS certs, and the `coolify` Docker network — do not modify those in the compose file
+- Cookie profiles (`.profiles/`) are not persisted across container recreations (no volume mounts)
+
 ## Environment Variables
 
 | Variable               | Purpose                           | Default         |
 |------------------------|-----------------------------------|-----------------|
 | `TRACKER_PROXY_URL`    | SOCKS5/HTTP proxy for browser     | none (direct)   |
+| `TRACKER_HEADED`       | Force headed mode immediately     | `false`         |
 | `TRACKER_ALLOW_HEADED` | Allow headed mode as last retry   | `false`         |
 
 ## Scripts

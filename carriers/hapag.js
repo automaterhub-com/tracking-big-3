@@ -1,4 +1,5 @@
 const { createTrackingSession } = require("../lib/browser");
+const { Solver } = require("2captcha-ts");
 const path = require("path");
 const fs = require("fs");
 
@@ -177,14 +178,64 @@ async function handleCloudflareChallenge(page) {
     return;
   }
 
-  // Save diagnostic screenshot
-  fs.mkdirSync(DIAG_DIR, { recursive: true });
-  await page.screenshot({
-    path: path.join(DIAG_DIR, "debug-challenge.png"),
-    fullPage: true,
+  // Attempt 3: Use 2captcha Turnstile solver
+  const apiKey = process.env.TWOCAPTCHA_API_KEY;
+  if (!apiKey) {
+    throw new Error("Cloudflare Turnstile challenge — set TWOCAPTCHA_API_KEY to solve automatically");
+  }
+
+  console.log("[hapag] Using 2captcha to solve Turnstile...");
+  const sitekey = await page.evaluate(() => {
+    const widget = document.querySelector('[data-sitekey]');
+    if (widget) return widget.getAttribute('data-sitekey');
+    const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+    if (iframe) {
+      const match = iframe.src.match(/[?&]k=([^&]+)/);
+      return match ? match[1] : null;
+    }
+    return null;
   });
-  console.log("[hapag] Challenge not solved — saved debug-challenge.png");
-  throw new Error("Cloudflare Turnstile challenge could not be solved automatically");
+
+  if (!sitekey) {
+    fs.mkdirSync(DIAG_DIR, { recursive: true });
+    await page.screenshot({ path: path.join(DIAG_DIR, "debug-challenge.png"), fullPage: true });
+    throw new Error("Could not extract Turnstile sitekey — saved debug-challenge.png");
+  }
+
+  console.log(`[hapag] Turnstile sitekey: ${sitekey}`);
+  const solver = new Solver(apiKey);
+  const result = await solver.cloudflareTurnstile({
+    pageurl: page.url(),
+    sitekey,
+  });
+
+  console.log(`[hapag] 2captcha returned token (${result.data.length} chars)`);
+
+  // Inject the token
+  await page.evaluate((token) => {
+    const input = document.querySelector('input[name="cf-turnstile-response"]');
+    if (input) input.value = token;
+    const gInput = document.querySelector('input[name="g-recaptcha-response"]');
+    if (gInput) gInput.value = token;
+    // Try triggering the callback
+    if (window.turnstileCallback) window.turnstileCallback(token);
+  }, result.data);
+
+  // Submit the form if present
+  await page.evaluate(() => {
+    const form = document.querySelector('form');
+    if (form) form.submit();
+  });
+
+  const solvedWith2captcha = await waitForChallengePass(page, 15000);
+  if (solvedWith2captcha) {
+    console.log("[hapag] Cloudflare challenge solved via 2captcha");
+    return;
+  }
+
+  fs.mkdirSync(DIAG_DIR, { recursive: true });
+  await page.screenshot({ path: path.join(DIAG_DIR, "debug-challenge.png"), fullPage: true });
+  throw new Error("Cloudflare Turnstile challenge could not be solved — saved debug-challenge.png");
 }
 
 async function waitForChallengePass(page, timeoutMs) {
