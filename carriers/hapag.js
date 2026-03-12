@@ -24,6 +24,8 @@ async function scrapeTracking(page, trackingNumber) {
   await new Promise((r) => setTimeout(r, 500 + Math.random() * 1000));
 
   // Inject turnstile.render() interception before navigating
+  // We capture params but still call origRender for auto-solve attempts.
+  // If 2captcha is needed, we'll use the captured callback.
   await page.addInitScript(() => {
     window.__turnstileParams = null;
     window.__tsCallback = null;
@@ -272,29 +274,53 @@ async function handleCloudflareChallenge(page) {
 
   console.log(`[hapag] 2captcha returned token (${token.length} chars)`);
 
-  // Inject the token via the Turnstile callback
+  // Inject the token: set hidden input + call callback
   const injected = await page.evaluate((tkn) => {
-    if (window.__tsCallback) {
-      window.__tsCallback(tkn);
-      return "callback";
-    }
+    const methods = [];
+    // Set the hidden input value
     const input = document.querySelector('input[name="cf-turnstile-response"]');
     if (input) {
       input.value = tkn;
-      const form = document.querySelector("form");
-      if (form) form.submit();
-      return "form";
+      methods.push("input");
     }
-    return "none";
+    // Call the Turnstile callback (triggers Cloudflare's validation)
+    if (window.__tsCallback) {
+      try { window.__tsCallback(tkn); methods.push("callback"); } catch (e) {
+        methods.push("callback-err:" + e.message);
+      }
+    }
+    return methods.join("+") || "none";
   }, token);
 
   console.log(`[hapag] Token injected via: ${injected}`);
 
-  const solvedWith2captcha = await waitForChallengePass(page, 15000);
+  // Give Cloudflare time to process the callback
+  await page.waitForTimeout(3000);
+
+  // If still on challenge page, try form submission as fallback
+  const stillChallenge = await page.textContent("body").catch(() => "");
+  if (stillChallenge.includes("Security Check") || stillChallenge.includes("Verify you are human")) {
+    console.log("[hapag] Still on challenge page, trying form submit...");
+    await page.evaluate(() => {
+      const form = document.querySelector("form");
+      if (form) form.submit();
+    });
+  }
+
+  // Wait for challenge to pass — Cloudflare may take time to validate + redirect
+  const solvedWith2captcha = await waitForChallengePass(page, 30000);
   if (solvedWith2captcha) {
     console.log("[hapag] Cloudflare challenge solved via 2captcha");
     return;
   }
+
+  // Debug: check page state after failed injection
+  const postState = await page.evaluate(() => ({
+    url: window.location.href,
+    bodySnippet: document.body.textContent.substring(0, 200),
+    tokenValue: document.querySelector('input[name="cf-turnstile-response"]')?.value?.length || 0,
+  }));
+  console.log("[hapag] Post-injection state:", JSON.stringify(postState));
 
   fs.mkdirSync(DIAG_DIR, { recursive: true });
   await page.screenshot({ path: path.join(DIAG_DIR, "debug-challenge.png"), fullPage: true });
