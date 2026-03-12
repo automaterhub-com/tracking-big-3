@@ -304,8 +304,8 @@ async function handleCloudflareChallenge(page) {
   await page.goto(TRACKING_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
   await page.waitForTimeout(3000);
 
-  const bodyText = await page.textContent("body").catch(() => "");
-  if (bodyText.includes("Security Check") || bodyText.includes("Verify you are human")) {
+  const afterReload = await page.textContent("body").catch(() => "");
+  if (afterReload.includes("Security Check") || afterReload.includes("Verify you are human")) {
     fs.mkdirSync(DIAG_DIR, { recursive: true });
     await page.screenshot({ path: path.join(DIAG_DIR, "debug-challenge.png"), fullPage: true });
     throw new Error("Cloudflare Turnstile challenge could not be solved — saved debug-challenge.png");
